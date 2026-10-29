@@ -17,6 +17,7 @@ import threading
 import time
 import re
 import select
+import signal
 import webbrowser
 import json
 import shutil
@@ -626,6 +627,10 @@ def _subprocess_common_kwargs():
     if IS_WINDOWS:
         kwargs['startupinfo'] = _SUBPROCESS_STARTUPINFO
         kwargs['creationflags'] = _SUBPROCESS_CREATIONFLAGS
+    else:
+        # Linux/POSIX: 让子进程独立成组，停止任务时可整组回收，
+        # 避免 GUI 终端里的信号（Ctrl+C）影响子进程，也避免残留进程占住管道
+        kwargs['start_new_session'] = True
     return kwargs
 
 
@@ -1338,6 +1343,9 @@ def run_adb_reboot():
 
 import queue as _queue
 
+# EOF 标记：与「读取超时」返回的 None 区分开，避免把流结束误当成暂时没数据
+_QUEUE_EOF = object()
+
 
 def _create_reader_queue(proc):
     """创建一个后台线程持续读取进程stdout的原始字节，返回queue供主线程消费。
@@ -1353,7 +1361,7 @@ def _create_reader_queue(proc):
                 q.put(data)
         except (OSError, ValueError):
             pass
-        q.put(None)  # sentinel 表示EOF
+        q.put(_QUEUE_EOF)  # sentinel 表示EOF
 
     t = threading.Thread(target=_reader_thread, daemon=True)
     t.start()
@@ -1361,11 +1369,88 @@ def _create_reader_queue(proc):
 
 
 def _read_queue(q, timeout=0.3):
-    """从queue中读取一块数据，超时返回None"""
+    """从queue中读取一块数据。
+    返回 bytes 表示数据；返回 None 表示超时（暂无数据）；
+    返回 _QUEUE_EOF 表示输出流已结束。"""
     try:
         return q.get(timeout=timeout)
     except _queue.Empty:
         return None
+
+
+def _terminate_process(proc, timeout=2.0):
+    """可靠地结束后台子进程（POSIX 下按进程组回收，避免孙进程占住管道）。
+    保证进程被 wait() 回收，避免僵尸进程和「线程退不出」的问题。"""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+
+    def _kill(sig):
+        try:
+            if IS_WINDOWS:
+                if sig == signal.SIGKILL:
+                    proc.kill()
+                else:
+                    proc.terminate()
+            else:
+                os.killpg(os.getpgid(proc.pid), sig)
+        except Exception:
+            try:
+                if sig == signal.SIGKILL:
+                    proc.kill()
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+
+    _kill(signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except Exception:
+        pass
+
+    _kill(signal.SIGKILL)
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        pass
+
+
+def _close_proc_pipes(proc):
+    """关闭子进程管道，确保读取线程能收到 EOF 并退出"""
+    if proc is None:
+        return
+    for stream in (getattr(proc, 'stdin', None),
+                   getattr(proc, 'stdout', None),
+                   getattr(proc, 'stderr', None)):
+        try:
+            if stream:
+                stream.close()
+        except Exception:
+            pass
+
+
+# 无法在限期内退出的线程在此保活，直到其真正结束
+_ORPHAN_WORKERS = []
+
+
+def _detach_worker(worker):
+    """保活仍在运行的工作线程。
+    否则 Qt 会在 QThread 对象被销毁时报
+    'QThread: Destroyed while thread is still running' 并直接结束进程。"""
+    if worker is None or worker in _ORPHAN_WORKERS:
+        return
+    _ORPHAN_WORKERS.append(worker)
+    try:
+        worker.finished.connect(
+            lambda w=worker: _ORPHAN_WORKERS.remove(w) if w in _ORPHAN_WORKERS else None)
+    except Exception:
+        pass
 
 
 def _read_proc_output(proc, timeout=0.5):
@@ -1738,11 +1823,8 @@ class RootWorker(QThread):
 
     def stop(self):
         self.stop_flag = True
-        if self.process:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
+        self._stdin_pipe = None
+        _terminate_process(self.process)
 
     def emit_output(self, text, color_type="output"):
         self.output_signal.emit(text, color_type)
@@ -1796,9 +1878,9 @@ class RootWorker(QThread):
 
             while not self.stop_flag:
                 raw = _read_queue(reader_q, 0.3)
+                if raw is _QUEUE_EOF:
+                    break
                 if raw is not None:
-                    if raw is None:  # EOF
-                        break
                     chunk = decode_bytes_smart(raw)
                     # 立即输出原始内容到内置终端（保留所有原始字符和颜色）
                     self.ansi_output_signal.emit(chunk)
@@ -1823,10 +1905,9 @@ class RootWorker(QThread):
                             # 持续读取输出直到进程退出或停止
                             while not self.stop_flag:
                                 raw = _read_queue(reader_q, 0.5)
-                                if raw is None:
-                                    if self.process.poll() is not None:
-                                        break
-                                elif raw:
+                                if raw is _QUEUE_EOF:
+                                    break
+                                if raw:
                                     self.ansi_output_signal.emit(decode_bytes_smart(raw))
                             break
                     if lines:
@@ -1836,7 +1917,7 @@ class RootWorker(QThread):
 
                 elif self.process.poll() is not None:
                     raw = _read_queue(reader_q, 0.1)
-                    while raw is not None:
+                    while raw not in (None, _QUEUE_EOF):
                         if raw:
                             self.ansi_output_signal.emit(decode_bytes_smart(raw))
                         raw = _read_queue(reader_q, 0.1)
@@ -1863,6 +1944,8 @@ class RootWorker(QThread):
         if self.stop_flag:
             self.emit_output("", "output")
             self.emit_output(tr('stopped_exec'), "warning")
+            self._stdin_pipe = None
+            _terminate_process(self.process)
             self.finished_signal.emit()
             return
 
@@ -1878,10 +1961,11 @@ class RootWorker(QThread):
             self.need_auto_retry_signal.emit()
 
         if self.process and not root_detected:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
+            _terminate_process(self.process)
+        if self.process and root_detected and self.process.poll() is not None:
+            # Root Shell 已退出：清空写端，避免后续输入继续往死管道写
+            self._stdin_pipe = None
+            _close_proc_pipes(self.process)
 
         self.finished_signal.emit()
 
@@ -1943,11 +2027,7 @@ class GetRootWorker(QThread):
 
     def stop(self):
         self.stop_flag = True
-        if self.process:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
+        _terminate_process(self.process)
 
     def emit_output(self, text, color_type="output"):
         self.output_signal.emit(text, color_type)
@@ -1978,17 +2058,19 @@ class GetRootWorker(QThread):
             reader_q = _create_reader_queue(proc)
             while not self.stop_flag:
                 raw = _read_queue(reader_q, 0.3)
+                if raw is _QUEUE_EOF:
+                    break
                 if raw is not None:
-                    if raw is None:  # EOF
-                        break
                     self.ansi_output_signal.emit(decode_bytes_smart(raw))
                 elif proc.poll() is not None:
                     raw = _read_queue(reader_q, 0.1)
-                    while raw is not None:
+                    while raw not in (None, _QUEUE_EOF):
                         if raw:
                             self.ansi_output_signal.emit(decode_bytes_smart(raw))
                         raw = _read_queue(reader_q, 0.1)
                     break
+            if self.stop_flag:
+                _terminate_process(proc)
             rc = proc.wait(timeout=timeout)
             return rc == 0
         except Exception as e:
@@ -2157,13 +2239,13 @@ class GetRootWorker(QThread):
                     cmd_start = time.time()
                     while not self.stop_flag and time.time() - cmd_start < 60:
                         raw = _read_queue(reader_q, 1.0)
-                        if raw is None:
+                        if raw is None or raw is _QUEUE_EOF:
                             break
                         if raw:
                             self.ansi_output_signal.emit(decode_bytes_smart(raw))
                         # 短暂等待更多输出
                         extra = _read_queue(reader_q, 0.5)
-                        if extra is None:
+                        if extra is None or extra is _QUEUE_EOF:
                             break
                         if extra:
                             self.ansi_output_signal.emit(decode_bytes_smart(extra))
@@ -2181,7 +2263,7 @@ class GetRootWorker(QThread):
                 # 读取剩余输出
                 while True:
                     raw = _read_queue(reader_q, 0.5)
-                    if raw is None:
+                    if raw is None or raw is _QUEUE_EOF:
                         break
                     if raw:
                         self.ansi_output_signal.emit(decode_bytes_smart(raw))
@@ -2189,10 +2271,8 @@ class GetRootWorker(QThread):
                 try:
                     shell_proc.wait(timeout=5)
                 except Exception:
-                    try:
-                        shell_proc.terminate()
-                    except Exception:
-                        pass
+                    _terminate_process(shell_proc)
+                _close_proc_pipes(shell_proc)
 
             except FileNotFoundError:
                 self.emit_output(tr('err_no_adb'), "error")
@@ -2272,17 +2352,19 @@ class KernelSUWorker(QThread):
             reader_q = _create_reader_queue(proc)
             while not self.stop_flag:
                 raw = _read_queue(reader_q, 0.3)
+                if raw is _QUEUE_EOF:
+                    break
                 if raw is not None:
-                    if raw is None:  # EOF
-                        break
                     self.ansi_output_signal.emit(decode_bytes_smart(raw))
                 elif proc.poll() is not None:
                     raw = _read_queue(reader_q, 0.1)
-                    while raw is not None:
+                    while raw not in (None, _QUEUE_EOF):
                         if raw:
                             self.ansi_output_signal.emit(decode_bytes_smart(raw))
                         raw = _read_queue(reader_q, 0.1)
                     break
+            if self.stop_flag:
+                _terminate_process(proc)
             rc = proc.wait(timeout=timeout)
             return rc == 0
         except Exception as e:
@@ -2474,11 +2556,7 @@ class AutoRetryWorker(QThread):
 
     def stop(self):
         self.stop_flag = True
-        if self.process:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
+        _terminate_process(self.process)
 
     def emit_output(self, text, color_type="output"):
         self.output_signal.emit(text, color_type)
@@ -2536,10 +2614,13 @@ class AutoRetryWorker(QThread):
                 while (not self.stop_flag and self.process
                        and self.process.poll() is None):
                     raw = _read_queue(self._reader_q, 0.3)
+                    if raw is _QUEUE_EOF:
+                        break
                     if raw is None:
                         continue
                     self.ansi_output_signal.emit(decode_bytes_smart(raw))
 
+                self._stdin_pipe = None
                 self.finished_signal.emit()
                 return
             else:
@@ -2670,9 +2751,9 @@ class AutoRetryWorker(QThread):
 
             while not self.stop_flag:
                 raw = _read_queue(reader_q, 0.3)
+                if raw is _QUEUE_EOF:
+                    break
                 if raw is not None:
-                    if raw is None:  # EOF
-                        break
                     chunk = decode_bytes_smart(raw)
                     self.ansi_output_signal.emit(chunk)
                     pending += chunk
@@ -2694,7 +2775,7 @@ class AutoRetryWorker(QThread):
                         break
                 elif process.poll() is not None:
                     raw = _read_queue(reader_q, 0.1)
-                    while raw is not None:
+                    while raw not in (None, _QUEUE_EOF):
                         if raw:
                             self.ansi_output_signal.emit(decode_bytes_smart(raw))
                         raw = _read_queue(reader_q, 0.1)
@@ -2704,18 +2785,13 @@ class AutoRetryWorker(QThread):
                     break
 
             if self.stop_flag:
-                try: process.terminate()
-                except Exception: pass
+                _terminate_process(process)
                 return False
 
             if root_detected:
                 return True
 
-            try:
-                if process.poll() is None:
-                    process.terminate()
-            except Exception:
-                pass
+            _terminate_process(process)
             if not check_device_connected():
                 self.emit_output(tr('err_disconnected_auto'), "error")
             else:
@@ -2770,11 +2846,7 @@ class CommandWorker(QThread):
 
     def stop(self):
         self.stop_flag = True
-        if self.process:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
+        _terminate_process(self.process)
 
     def run(self):
         self.output_signal.emit(f"$ {self.command}", "command")
@@ -2782,36 +2854,45 @@ class CommandWorker(QThread):
             self.process = subprocess.Popen(
                 self.command, shell=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE, bufsize=0, cwd=os.getcwd(),
+                # 关键修复：stdin 不能留成永不写入的管道，
+                # 否则 cat / sh / adb shell 等读取 stdin 的命令会永久阻塞，
+                # 该会话之后的每条命令都会提示「上一个命令仍在执行中」
+                stdin=subprocess.DEVNULL, bufsize=0, cwd=os.getcwd(),
                 **_subprocess_common_kwargs())
 
             reader_q = _create_reader_queue(self.process)
             while not self.stop_flag:
                 raw = _read_queue(reader_q, 0.3)
+                if raw is _QUEUE_EOF:
+                    break
                 if raw is not None:
-                    if raw is None:  # EOF
-                        break
                     self.ansi_output_signal.emit(decode_bytes_smart(raw))
                 elif self.process.poll() is not None:
-                    raw = _read_queue(reader_q, 0.1)
-                    while raw is not None:
+                    # 进程已退出，读完队列中剩余输出再结束
+                    while True:
+                        raw = _read_queue(reader_q, 0.1)
+                        if raw is None or raw is _QUEUE_EOF:
+                            break
                         if raw:
                             self.ansi_output_signal.emit(decode_bytes_smart(raw))
-                        raw = _read_queue(reader_q, 0.1)
                     break
 
             if self.stop_flag:
-                try: self.process.terminate()
-                except Exception: pass
+                _terminate_process(self.process)
                 self.output_signal.emit(tr('ctrl_c_interrupted'), "warning")
             else:
-                rc = self.process.poll()
-                if rc and rc != 0:
+                try:
+                    rc = self.process.wait(timeout=2)
+                except Exception:
+                    _terminate_process(self.process)
+                    rc = self.process.poll()
+                if rc not in (None, 0):
                     self.output_signal.emit(f"{tr('exit_code').format(rc)}", "system")
         except Exception as e:
             self.output_signal.emit(f"{tr('error_prefix').format(str(e))}", "error")
-
-        self.finished_signal.emit()
+        finally:
+            _close_proc_pipes(self.process)
+            self.finished_signal.emit()
 
 
 # ==================== 关于对话框 ====================
@@ -3244,6 +3325,16 @@ class TerminalSession(QWidget):
 
         layout.addWidget(input_frame)
 
+        # Linux 下点击按钮会让按钮获得键盘焦点，之后在输入框回车容易误触发
+        # 「新建会话 / 执行」等按钮（表现为新建的会话直接切走或退出）。
+        # 这些操作按钮只应响应鼠标点击，键盘焦点始终留给输入框。
+        for btn in (self.execute_btn, self.root_btn, self.get_root_btn,
+                    self.stop_btn, self.new_session_btn, self.lang_btn,
+                    self.refresh_file_btn, self.run_btn):
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+
     def _connect_signals(self):
         self.execute_btn.clicked.connect(self._on_execute_clicked)
         self.root_btn.clicked.connect(self._on_root_clicked)
@@ -3590,22 +3681,42 @@ class TerminalSession(QWidget):
         command = self.input_box.text().strip()
         if not command:
             return
+        try:
+            self._dispatch_command(command)
+        except Exception as e:
+            # Qt 槽函数中未捕获的异常会让 PyQt 直接终止整个进程，
+            # 这里必须兜住，避免「输入一条命令程序就退出」
+            self._append_output(f"{tr('error_prefix').format(str(e))}", "error")
 
-        if self.active_root_shell and self.active_root_shell._stdin_pipe:
-            shell = self.active_root_shell
-            proc_dead = shell.process is not None and shell.process.poll() is not None
-            if proc_dead or shell._stdin_pipe.closed:
+    def _dispatch_command(self, command):
+        shell = self.active_root_shell
+        if shell is not None:
+            pipe = getattr(shell, '_stdin_pipe', None)
+            proc = getattr(shell, 'process', None)
+            proc_dead = proc is None or proc.poll() is not None
+            if pipe is None:
+                # 还没有真正可用的 Root Shell（例如提权仍在进行），回退普通命令
+                shell = None
+            elif proc_dead or pipe.closed:
                 self.active_root_shell = None
                 self._append_output(tr('root_shell_closed'), "system")
+                shell = None
             else:
                 self._append_output(f"# {command}", "command")
                 if shell.send_to_shell(command):
                     self.input_box.clear()
                     return
+                # 写入失败说明 Root Shell 已不可用，清掉并回退到普通命令
+                self.active_root_shell = None
+                self._append_output(tr('root_shell_closed'), "system")
 
         if self.command_worker and self.command_worker.isRunning():
-            self._append_output(tr('warn_prev_running'), "warning")
-            return
+            # 用户刚按过「停止」时，旧线程通常只差收尾，短暂等待而不是直接报错
+            if self.command_worker.stop_flag:
+                self.command_worker.wait(1000)
+            if self.command_worker.isRunning():
+                self._append_output(tr('warn_prev_running'), "warning")
+                return
 
         self.input_box.clear()
         self.command_worker = CommandWorker(command)
@@ -3622,12 +3733,21 @@ class TerminalSession(QWidget):
         return any(w and w.isRunning() for w in workers)
 
     def cleanup(self):
-        for worker in [self.execute_worker, self.root_worker,
-                       self.get_root_worker, self.kernelsu_worker,
-                       self.auto_retry_worker, self.command_worker]:
-            if worker and worker.isRunning():
+        for name in ('execute_worker', 'root_worker', 'get_root_worker',
+                     'kernelsu_worker', 'auto_retry_worker', 'command_worker'):
+            worker = getattr(self, name, None)
+            if worker is None:
+                continue
+            if worker.isRunning():
                 worker.stop()
-                worker.wait(3000)
+                if not worker.wait(2000):
+                    _terminate_process(getattr(worker, 'process', None))
+                    worker.wait(2000)
+            if worker.isRunning():
+                # 仍无法退出时保持引用，防止 QThread 在运行中被析构导致进程 abort
+                _detach_worker(worker)
+            elif getattr(self, name, None) is worker:
+                setattr(self, name, None)
 
 
 # ==================== 自定义标题栏 ====================
@@ -3806,7 +3926,10 @@ class MainWindow(QMainWindow):
         session.language_changed.connect(self._on_language_changed)
         self.tab_widget.addTab(session, f"  {tr('session_title').format(self.session_count)}")
         self.tab_widget.setCurrentWidget(session)
-        session.input_box.setFocus()
+        # 新建会话后确保焦点落在输入框：Linux 下如果焦点留在「新建会话」按钮上，
+        # 输入命令后按回车会再次触发新建，看起来就像当前会话直接退出
+        session.input_box.setFocus(Qt.OtherFocusReason)
+        QTimer.singleShot(0, lambda s=session: s.input_box.setFocus(Qt.OtherFocusReason))
 
     def _on_language_changed(self):
         """语言切换时更新所有会话和标题"""
